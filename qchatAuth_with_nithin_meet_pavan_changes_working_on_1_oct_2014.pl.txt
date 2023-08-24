@@ -1,0 +1,343 @@
+use strict;
+use Digest::MD5;
+use Digest::SHA;
+use Bytes::Random;
+use Switch;
+# use ...
+# This is very important ! Without this script will not get the filled hashesh from main.
+use vars qw(%RAD_REQUEST %RAD_REPLY %RAD_CHECK %RAD_CONFIG);
+use Data::Dumper;
+
+# This is hash wich hold original request from radius
+#my %RAD_REQUEST;
+# In this hash you add values that will be returned to NAS.
+#my %RAD_REPLY;
+#This is for check items
+#my %RAD_CHECK;
+
+#
+# This the remapping of return values
+#
+	use constant    RLM_MODULE_REJECT=>    0;#  /* immediately reject the request */
+	use constant	RLM_MODULE_FAIL=>      1;#  /* module failed, don't reply */
+	use constant	RLM_MODULE_OK=>        2;#  /* the module is OK, continue */
+	use constant	RLM_MODULE_HANDLED=>   3;#  /* the module handled the request, so stop. */
+	use constant	RLM_MODULE_INVALID=>   4;#  /* the module considers the request invalid. */
+	use constant	RLM_MODULE_USERLOCK=>  5;#  /* reject the request (user is locked out) */
+	use constant	RLM_MODULE_NOTFOUND=>  6;#  /* user not found */
+	use constant	RLM_MODULE_NOOP=>      7;#  /* module succeeded without doing anything */
+	use constant	RLM_MODULE_UPDATED=>   8;#  /* OK (pairs modified) */
+	use constant	RLM_MODULE_NUMCODES=>  9;#  /* How many return codes there are */
+
+{
+
+##### Global static configuration population #######
+	my %static_global_qchat_conf = ();
+	open (QCHAT_CONF_FILE, '<', "/etc/raddb/qchat.conf") or die "Failed to open qchat.conf";
+	while (<QCHAT_CONF_FILE>) {
+	    chomp;                  # no newline
+	    s/#.*//;                # no comments
+	    s/^\s+//;               # no leading white
+	    s/\s+$//;               # no trailing white
+	    next unless length;     # anything left?
+	    my ($var, $value) = split(/\s*=\s*/, $_, 2);
+	    print "making map:[".$var."]=".$value."\n";
+	    $static_global_qchat_conf{$var} = $value;
+	}
+##### End of configuration section
+
+
+
+# Function to handle authenticate
+sub authenticate {
+	# For debugging purposes only
+	&log_request_attributes;
+
+	# check if ldap module is trying to pass the looked up checkItem
+	# to the authenticate module or else user whatever password was
+	# found in authentication module/incoming request
+	if(exists $RAD_CHECK{'User-Password'} ) {
+		$RAD_REQUEST{'User-Password'} = $RAD_CHECK{'User-Password'};
+	}
+
+
+
+print "RAD_CHECK : \n";
+print Dumper(\%RAD_CHECK);
+print "RAD_CONFIG : \n";
+print Dumper(\%RAD_CONFIG);
+print "RAD_REQUEST : \n";
+print Dumper(\%RAD_REQUEST);
+
+
+	# 5.0- QChat compliant password conversion
+	if($static_global_qchat_conf{'convertToBAK'}){
+		if($static_global_qchat_conf{'USE_NII'})
+		{
+		print "Using NII \n";  
+		&makeBAKNII;
+		}
+		else
+		{
+                print "Using CT \n";   
+	     	&makeBAKCT; 
+		}
+	}
+
+        my $authenticated = &authDigest;
+
+	if ($authenticated == 0) {
+		# Reject user
+		return RLM_MODULE_REJECT;
+	} else {
+		# Accept user	
+		return RLM_MODULE_OK;
+	}
+}
+
+sub log_request_attributes {
+	# This shouldn't be done in production environments!
+	# This is only meant for debugging!
+	for (keys %RAD_REQUEST) {
+		&radiusd::radlog(1, "RAD_REQUEST: $_ = $RAD_REQUEST{$_}");
+	}
+
+	for (keys %RAD_CONFIG) {
+		&radiusd::radlog(1, "RAD_CONFIG: $_ = $RAD_CONFIG{$_}");
+	}
+
+	for (keys %RAD_CHECK) {
+		&radiusd::radlog(1, "RAD_CHECK: $_ = $RAD_CHECK{$_}");
+	}
+
+	for (keys %RAD_REPLY) {
+		&radiusd::radlog(1, "RAD_REPLY: $_ = $RAD_REPLY{$_}");
+	}
+}
+
+sub digestAttributes {
+	my %digestAttributes;
+	my @digestAttribute =  $RAD_REQUEST{'Digest-Attributes'};
+	my $local_ref = $digestAttribute[0];
+	my $i;
+	my $byteString;
+	my $type;
+	my $len;
+	my $val;
+	&radiusd::radlog(1, "Converting Digest Attributes to readable values");
+	for ($i=0; $i <= $#$local_ref; $i++) {
+	    $byteString = pack "H*", substr($local_ref->[$i],2);
+	    $type = ord(substr($byteString, 0,1));
+	    $len = ord(substr($byteString, 1,2));
+	    $val = substr($byteString, 2);
+
+	   # As per the draft-sterman-aaa-sip-00 ietf rfc
+	    switch($type){
+		case 1 {
+			$digestAttributes{"Digest-Realm"} = $val;
+			&radiusd::radlog(1, "\t\tDigest-Realm: \"$val\"");
+		}
+		case 2 {
+			$digestAttributes{"Digest-Nonce"} = $val;
+			&radiusd::radlog(1, "\t\tDigest-Nonce: \"$val\"");
+		}
+		case 3 {
+			$digestAttributes{"Digest-Method"} = $val;
+			&radiusd::radlog(1, "\t\tDigest-Method: \"$val\"");
+		}
+		case 4 {
+			$digestAttributes{"Digest-URI"} = $val;
+			&radiusd::radlog(1, "\t\tDigest-URI: \"$val\"");
+		}
+		case 5 {
+			$digestAttributes{"Digest-QOP"} = $val;
+			&radiusd::radlog(1, "\t\tDigest-QOP: \"$val\"");
+		}
+		case 6 {
+			$digestAttributes{"Digest-Algorithm"} = $val;
+			&radiusd::radlog(1, "\t\tDigest-Algorithm: \"$val\"");
+		}
+		case 7 {
+			$digestAttributes{"Digest-Body-Digest"} = $val;
+			&radiusd::radlog(1, "\t\tDigest-Body-Digest: \"$val\"");
+		}
+		case 8 { 
+			$digestAttributes{"Digest-CNonce"} = $val;
+			&radiusd::radlog(1, "\t\tDigest-CNonce: \"$val\"");
+		}
+		case 9 {
+			$digestAttributes{"Digest-Nonce-Count"} = $val;
+			&radiusd::radlog(1, "\t\tDigest-Nonce-Count: \"$val\"");
+		}
+		case 10 {
+			$digestAttributes{"Digest-User-Name"} = $val;
+			&radiusd::radlog(1, "\t\tDigest-User-Name: \"$val\"");
+		}
+
+	    }
+	    
+	}
+	return %digestAttributes;
+}
+
+sub makeBAKNII{
+        &radiusd::radlog(1, "BAKSeed to BAK Conversion");
+        &radiusd::radlog(1, "BAKSeed: \"".$RAD_REQUEST{'User-Password'}."\"");
+
+        #convert to binary
+        my $hexPassword = unpack "H*", $RAD_REQUEST{'User-Password'};
+	&radiusd::radlog(1,"Hex Password\"".$hexPassword."\"");
+
+        #BAK = SHA256(binaryBAKSeed:create_bak);
+        my $carrierString;
+	if(exists $static_global_qchat_conf{'carrier_string'}) {
+	        $carrierString = $static_global_qchat_conf{'carrier_string'}; 
+	}
+	else {
+		#default value
+		$carrierString = 'create_bak';
+	}
+
+	my $hexCarrierString =unpack "H*",$carrierString;
+	&radiusd::radlog(1,"Hex Carrier String\"".$hexCarrierString."\"");
+
+        my $ctx = Digest::SHA->new('SHA-256');
+	$ctx->add($hexPassword.":".$hexCarrierString);
+        my $hexdigest = $ctx->hexdigest();
+
+
+        $hexdigest = substr($hexdigest, 32);
+        &radiusd::radlog(1, "BAK: \"".$hexdigest."\"");
+        my $bindigest = pack "H*", $hexdigest;
+        &radiusd::radlog(1, "Lower-128-bits: \"".$hexdigest."\"");
+        $RAD_REQUEST{'User-Password'} = $bindigest;
+}
+
+sub makeBAKCT {
+        my $hexdigest;
+        open (readbak, "</etc/raddb/user-bak") || die "could not open user-bak file"; 			# Open user-bak file
+        while  (my $line = <readbak>) 									#loop till last line
+	{
+        $line =~ m/\s+/; 										#Match the content of line till one or more space
+#	print $line; 
+	my $User_addr = "$`";										# Store the characters till space in variable named User_addr
+#	print "ct debug for $User_addr \n"; 
+	print "ct debug for rad username:$RAD_REQUEST{'User-Name'} \n";
+		if ($RAD_REQUEST{'User-Name'} eq $User_addr) 						#Compare the Username with variable User_addr
+		{ 
+		$line =~ m/\"(.*)\"/;									#If condition meets Match the line within double inverted commas (bak)
+	#	print $1, "\n";
+		 $hexdigest =  $1;									#Store the bak in hexdigest variable
+		last;											
+		}
+	}
+	close(readbak); 										#Close user-bak file
+        print  "ct debug for hexdigest: $hexdigest\n";
+	my $bindigest = pack "H*", $hexdigest;								#Converting hexdigest into binary and storing it into variable bindigest
+        $RAD_REQUEST{'User-Password'} = $bindigest;
+        print "ct debug for bindigest: $bindigest\n";
+        print "ct debug for rad last: $RAD_REQUEST{'User-Password'}\n"
+}
+sub makeBAKSN {
+        &radiusd::radlog(1, "BAKSeed to BAK Conversion");
+        &radiusd::radlog(1, "BAKSeed: \"".$RAD_REQUEST{'User-Password'}."\"");
+
+        #convert to binary
+        my $binPassword = pack "H*", $RAD_REQUEST{'User-Password'};
+
+        #BAK = SHA256(binaryBAKSeed:create_bak);
+        my $carrierString;
+	if(exists $static_global_qchat_conf{'carrier_string'}) {
+	        $carrierString = $static_global_qchat_conf{'carrier_string'}; 
+	}
+	else {
+		#default value
+		$carrierString = 'create_bak';
+	}
+        $carrierString =~ s/(.)/sprintf("%x",ord($1))/eg;
+        $carrierString = uc($carrierString);
+
+        my $ctx = Digest::SHA->new('SHA-256');
+        $ctx->add($binPassword);
+        $ctx->add($carrierString);
+        my $hexdigest = $ctx->hexdigest();
+
+
+        &radiusd::radlog(1, "BAK: \"".$hexdigest."\"");
+        $hexdigest = substr($hexdigest, 32);
+        my $bindigest = pack "H*", $hexdigest;
+        &radiusd::radlog(1, "Lower-128-bits: \"".$hexdigest."\"");
+        $RAD_REQUEST{'User-Password'} = $bindigest;
+}
+
+sub authDigest {
+	&radiusd::radlog(1, "User-Password : ".$RAD_REQUEST{'User-Password'});
+	my %dAttr = &digestAttributes;
+	my $authenticated = 0;
+	my ( $ha1, $ha2, $expected);
+
+	# if algorithm == MD5 then A1 = unq(username-value) ":" unq(realm-value) ":" passwd
+	# if algorithm == MD5-sess then A1 = H(unq(username-value) ":" unq(realm-value) ":" passwd) ":" unq(nonce-value) ":" unq(cnonce-value)
+	my $ctx = Digest::MD5->new();
+	$ctx->add($dAttr{'Digest-User-Name'});
+	$ctx->add(":");
+	$ctx->add($dAttr{'Digest-Realm'});
+	$ctx->add(":");
+	$ctx->add($RAD_REQUEST{'User-Password'});
+	$ha1 = $ctx->hexdigest();
+	if($dAttr{'Digest-Algorithm'} eq 'MD5-sess') {
+		$ctx->reset();
+		$ctx->add($ha1);
+		$ctx->add(":");
+		$ctx->add($dAttr{'Digest-Nonce'});
+		$ctx->add(":");
+		$ctx->add($dAttr{'Digest-CNonce'});
+		$ha1 = $ctx->hexdigest();
+	}
+
+	# if qop = auth then  A2 = Method ":" digest-uri-value 
+	# if qop = auth-int then A2 = Method ":" digest-uri-value ":" H(entity-body)
+	$ctx->reset();
+	$ctx->add($dAttr{'Digest-Method'});
+	$ctx->add(":");
+	$ctx->add($dAttr{'Digest-URI'});
+
+	if($dAttr{'Digest-QOP'} eq 'auth-int') {
+		my $authIntCtx = Digest::MD5->new();
+		$authIntCtx->add($dAttr{'Digest-Body-Digest'});
+		$ctx->add( $authIntCtx->hexdigest());
+	}
+	$ha2 = $ctx->hexdigest();
+
+	#Digest = <"> KD( H(A1), unq(nonce-value) ":" nc-value ":" unq(cnonce-value) ":" unq(qop-value) ":" H(A2) ) <">
+	$ctx->reset();	
+	$ctx->add($ha1);
+	$ctx->add(":");
+	$ctx->add($dAttr{'Digest-Nonce'});
+	$ctx->add(":");
+	$ctx->add($dAttr{'Digest-Nonce-Count'});
+	$ctx->add(":");
+	$ctx->add($dAttr{'Digest-CNonce'});
+	$ctx->add(":");
+	$ctx->add($dAttr{'Digest-QOP'});
+	$ctx->add(":");
+	$ctx->add($ha2);	
+
+	$expected = $ctx->hexdigest();
+	&radiusd::radlog(1, "H(A1) = $ha1");
+	&radiusd::radlog(1, "H(A2) = $ha2");
+	&radiusd::radlog(1, "EXPECTED $expected");
+	&radiusd::radlog(1, "RECEIVED ".$RAD_REQUEST{'Digest-Response'});
+
+	if ( $expected eq $RAD_REQUEST{'Digest-Response'}) { $authenticated = 1; }
+
+	#QChat specific section to send back the correct values
+	if ( $dAttr{'Digest-Method'} eq "QCHAT-REGISTER") {
+		$RAD_REPLY{'MS-MPPE-Recv-Key'} = "0x$ha1";
+#		$RAD_REPLY{'Session-Timeout'} = $static_global_qchat_conf{'qskTTL'};
+	}
+	return $authenticated;
+
+}
+
+}
